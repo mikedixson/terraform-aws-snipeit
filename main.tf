@@ -2,322 +2,869 @@
 locals {
   app_name = "assets-inventory-company"
   app_url  = "https://assets.inventory.company.com"
-}
 
-# Data Source to fetch the current client config
-data "azurerm_client_config" "current" {}
-
-# Resource Group
-resource "azurerm_resource_group" "assets" {
-  name     = "Inventory"
-  location = "Canada Central"
-  tags = {
-    GitOps = "Terraformed"
+  common_tags = {
+    GitOps      = "Terraformed"
+    Application = "Snipe-IT"
   }
 }
 
-# Virtual Network
-resource "azurerm_virtual_network" "assets_vnet" {
-  name                = "assets-vnet"
-  address_space       = ["10.0.0.0/16"]
-  location            = azurerm_resource_group.assets.location
-  resource_group_name = azurerm_resource_group.assets.name
+# Data source to get current AWS region
+data "aws_region" "current" {}
+
+# Data source to get current AWS account ID
+data "aws_caller_identity" "current" {}
+
+# Data source to get available AZs
+data "aws_availability_zones" "available" {
+  state = "available"
 }
 
-# Subnet for general assets
-resource "azurerm_subnet" "assets_subnet" {
-  name                 = "assets-subnet"
-  resource_group_name  = azurerm_resource_group.assets.name
-  virtual_network_name = azurerm_virtual_network.assets_vnet.name
-  address_prefixes     = ["10.0.2.0/24"]
+#------------------------------------------------------------------------------
+# VPC and Networking
+#------------------------------------------------------------------------------
 
-  delegation {
-    name = "webappDelegation"
-    service_delegation {
-      name    = "Microsoft.Web/serverFarms"
-      actions = ["Microsoft.Network/virtualNetworks/subnets/action"]
+# VPC
+resource "aws_vpc" "assets_vpc" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = merge(local.common_tags, {
+    Name = "assets-vpc"
+  })
+}
+
+# Internet Gateway
+resource "aws_internet_gateway" "assets_igw" {
+  vpc_id = aws_vpc.assets_vpc.id
+
+  tags = merge(local.common_tags, {
+    Name = "assets-igw"
+  })
+}
+
+# Public Subnet for ALB
+resource "aws_subnet" "public_subnet_1" {
+  vpc_id                  = aws_vpc.assets_vpc.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = true
+
+  tags = merge(local.common_tags, {
+    Name = "assets-public-subnet-1"
+  })
+}
+
+resource "aws_subnet" "public_subnet_2" {
+  vpc_id                  = aws_vpc.assets_vpc.id
+  cidr_block              = "10.0.4.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[1]
+  map_public_ip_on_launch = true
+
+  tags = merge(local.common_tags, {
+    Name = "assets-public-subnet-2"
+  })
+}
+
+# Private Subnet for ECS
+resource "aws_subnet" "ecs_subnet" {
+  vpc_id            = aws_vpc.assets_vpc.id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = data.aws_availability_zones.available.names[0]
+
+  tags = merge(local.common_tags, {
+    Name = "assets-ecs-subnet"
+  })
+}
+
+# Private Subnet for ECS (second AZ for high availability)
+resource "aws_subnet" "ecs_subnet_2" {
+  vpc_id            = aws_vpc.assets_vpc.id
+  cidr_block        = "10.0.5.0/24"
+  availability_zone = data.aws_availability_zones.available.names[1]
+
+  tags = merge(local.common_tags, {
+    Name = "assets-ecs-subnet-2"
+  })
+}
+
+# Private Subnet for RDS MySQL
+resource "aws_subnet" "mysql_subnet_1" {
+  vpc_id            = aws_vpc.assets_vpc.id
+  cidr_block        = "10.0.3.0/24"
+  availability_zone = data.aws_availability_zones.available.names[0]
+
+  tags = merge(local.common_tags, {
+    Name = "assets-mysql-subnet-1"
+  })
+}
+
+resource "aws_subnet" "mysql_subnet_2" {
+  vpc_id            = aws_vpc.assets_vpc.id
+  cidr_block        = "10.0.6.0/24"
+  availability_zone = data.aws_availability_zones.available.names[1]
+
+  tags = merge(local.common_tags, {
+    Name = "assets-mysql-subnet-2"
+  })
+}
+
+# Elastic IP for NAT Gateway
+resource "aws_eip" "nat_eip" {
+  domain = "vpc"
+
+  tags = merge(local.common_tags, {
+    Name = "assets-nat-eip"
+  })
+
+  depends_on = [aws_internet_gateway.assets_igw]
+}
+
+# NAT Gateway for private subnets
+resource "aws_nat_gateway" "assets_nat" {
+  allocation_id = aws_eip.nat_eip.id
+  subnet_id     = aws_subnet.public_subnet_1.id
+
+  tags = merge(local.common_tags, {
+    Name = "assets-nat-gateway"
+  })
+
+  depends_on = [aws_internet_gateway.assets_igw]
+}
+
+# Route Table for public subnets
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.assets_vpc.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.assets_igw.id
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "assets-public-rt"
+  })
+}
+
+# Route Table for private subnets
+resource "aws_route_table" "private_rt" {
+  vpc_id = aws_vpc.assets_vpc.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.assets_nat.id
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "assets-private-rt"
+  })
+}
+
+# Route table associations
+resource "aws_route_table_association" "public_1" {
+  subnet_id      = aws_subnet.public_subnet_1.id
+  route_table_id = aws_route_table.public_rt.id
+}
+
+resource "aws_route_table_association" "public_2" {
+  subnet_id      = aws_subnet.public_subnet_2.id
+  route_table_id = aws_route_table.public_rt.id
+}
+
+resource "aws_route_table_association" "ecs_1" {
+  subnet_id      = aws_subnet.ecs_subnet.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+resource "aws_route_table_association" "ecs_2" {
+  subnet_id      = aws_subnet.ecs_subnet_2.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+resource "aws_route_table_association" "mysql_1" {
+  subnet_id      = aws_subnet.mysql_subnet_1.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+resource "aws_route_table_association" "mysql_2" {
+  subnet_id      = aws_subnet.mysql_subnet_2.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+#------------------------------------------------------------------------------
+# Security Groups
+#------------------------------------------------------------------------------
+
+# Security Group for ALB
+resource "aws_security_group" "alb_sg" {
+  name        = "assets-alb-sg"
+  description = "Security group for Application Load Balancer"
+  vpc_id      = aws_vpc.assets_vpc.id
+
+  ingress {
+    description = "HTTPS from anywhere"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTP from anywhere (redirect to HTTPS)"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "assets-alb-sg"
+  })
+}
+
+# Security Group for ECS Tasks
+resource "aws_security_group" "ecs_sg" {
+  name        = "assets-ecs-sg"
+  description = "Security group for ECS tasks"
+  vpc_id      = aws_vpc.assets_vpc.id
+
+  ingress {
+    description     = "HTTP from ALB"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "assets-ecs-sg"
+  })
+}
+
+# Security Group for RDS MySQL
+resource "aws_security_group" "mysql_sg" {
+  name        = "assets-mysql-sg"
+  description = "Security group for RDS MySQL"
+  vpc_id      = aws_vpc.assets_vpc.id
+
+  ingress {
+    description     = "MySQL from ECS"
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs_sg.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "assets-mysql-sg"
+  })
+}
+
+# Security Group for EFS
+resource "aws_security_group" "efs_sg" {
+  name        = "assets-efs-sg"
+  description = "Security group for EFS"
+  vpc_id      = aws_vpc.assets_vpc.id
+
+  ingress {
+    description     = "NFS from ECS"
+    from_port       = 2049
+    to_port         = 2049
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs_sg.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "assets-efs-sg"
+  })
+}
+
+#------------------------------------------------------------------------------
+# AWS Secrets Manager (equivalent to Azure Key Vault)
+#------------------------------------------------------------------------------
+
+# Secret for DB Admin Password
+resource "aws_secretsmanager_secret" "db_admin_password" {
+  name                    = "assets-inventory/db-admin-password"
+  recovery_window_in_days = 7
+
+  tags = local.common_tags
+}
+
+# Note: You must set the secret value manually or via AWS CLI after creation
+# aws secretsmanager put-secret-value --secret-id assets-inventory/db-admin-password --secret-string "your-password"
+
+# Secret for App Key
+resource "aws_secretsmanager_secret" "app_key" {
+  name                    = "assets-inventory/app-key"
+  recovery_window_in_days = 7
+
+  tags = local.common_tags
+}
+
+# Secret for SendGrid API Key
+resource "aws_secretsmanager_secret" "sendgrid_api_key" {
+  name                    = "assets-inventory/sendgrid-api-key"
+  recovery_window_in_days = 7
+
+  tags = local.common_tags
+}
+
+# Data sources to read secret values (secrets must be populated first)
+data "aws_secretsmanager_secret_version" "db_admin_password" {
+  secret_id  = aws_secretsmanager_secret.db_admin_password.id
+  depends_on = [aws_secretsmanager_secret.db_admin_password]
+}
+
+data "aws_secretsmanager_secret_version" "app_key" {
+  secret_id  = aws_secretsmanager_secret.app_key.id
+  depends_on = [aws_secretsmanager_secret.app_key]
+}
+
+data "aws_secretsmanager_secret_version" "sendgrid_api_key" {
+  secret_id  = aws_secretsmanager_secret.sendgrid_api_key.id
+  depends_on = [aws_secretsmanager_secret.sendgrid_api_key]
+}
+
+#------------------------------------------------------------------------------
+# RDS MySQL (equivalent to Azure MySQL Flexible Server)
+#------------------------------------------------------------------------------
+
+# DB Subnet Group
+resource "aws_db_subnet_group" "mysql_subnet_group" {
+  name       = "assets-mysql-subnet-group"
+  subnet_ids = [aws_subnet.mysql_subnet_1.id, aws_subnet.mysql_subnet_2.id]
+
+  tags = merge(local.common_tags, {
+    Name = "assets-mysql-subnet-group"
+  })
+}
+
+# RDS Parameter Group for MySQL configuration
+resource "aws_db_parameter_group" "mysql_params" {
+  family = "mysql8.0"
+  name   = "assets-mysql-params"
+
+  parameter {
+    name  = "innodb_buffer_pool_load_at_startup"
+    value = "0"
+  }
+
+  parameter {
+    name  = "innodb_buffer_pool_dump_at_shutdown"
+    value = "0"
+  }
+
+  parameter {
+    name  = "sql_generate_invisible_primary_key"
+    value = "0"
+  }
+
+  tags = local.common_tags
+}
+
+# RDS MySQL Instance
+resource "aws_db_instance" "assets_inventory_db" {
+  identifier     = "assets-inventory-db"
+  engine         = "mysql"
+  engine_version = "8.0"
+  instance_class = "db.t3.micro"
+
+  allocated_storage     = 20
+  max_allocated_storage = 100
+  storage_type          = "gp3"
+  storage_encrypted     = true
+
+  db_name  = "snipeit"
+  username = "assetsadmin"
+  password = data.aws_secretsmanager_secret_version.db_admin_password.secret_string
+
+  db_subnet_group_name   = aws_db_subnet_group.mysql_subnet_group.name
+  vpc_security_group_ids = [aws_security_group.mysql_sg.id]
+  parameter_group_name   = aws_db_parameter_group.mysql_params.name
+
+  multi_az            = false
+  publicly_accessible = false
+
+  backup_retention_period = 7
+  backup_window           = "03:00-04:00"
+  maintenance_window      = "Mon:04:00-Mon:05:00"
+
+  skip_final_snapshot       = false
+  final_snapshot_identifier = "assets-inventory-db-final-snapshot"
+  deletion_protection       = true
+
+  tags = merge(local.common_tags, {
+    Name = "assets-inventory-db"
+  })
+}
+
+#------------------------------------------------------------------------------
+# EFS (equivalent to Azure Storage Account File Shares)
+#------------------------------------------------------------------------------
+
+# EFS File System for Snipe-IT data
+resource "aws_efs_file_system" "snipeit_efs" {
+  creation_token = "snipeit-efs"
+  encrypted      = true
+
+  performance_mode = "generalPurpose"
+  throughput_mode  = "bursting"
+
+  lifecycle_policy {
+    transition_to_ia = "AFTER_30_DAYS"
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "snipeit-efs"
+  })
+}
+
+# EFS Mount Targets
+resource "aws_efs_mount_target" "snipeit_efs_mount_1" {
+  file_system_id  = aws_efs_file_system.snipeit_efs.id
+  subnet_id       = aws_subnet.ecs_subnet.id
+  security_groups = [aws_security_group.efs_sg.id]
+}
+
+resource "aws_efs_mount_target" "snipeit_efs_mount_2" {
+  file_system_id  = aws_efs_file_system.snipeit_efs.id
+  subnet_id       = aws_subnet.ecs_subnet_2.id
+  security_groups = [aws_security_group.efs_sg.id]
+}
+
+# EFS Access Points
+resource "aws_efs_access_point" "snipeit_data" {
+  file_system_id = aws_efs_file_system.snipeit_efs.id
+
+  posix_user {
+    gid = 1000
+    uid = 1000
+  }
+
+  root_directory {
+    path = "/snipeit-data"
+    creation_info {
+      owner_gid   = 1000
+      owner_uid   = 1000
+      permissions = "755"
     }
   }
+
+  tags = merge(local.common_tags, {
+    Name = "snipeit-data-ap"
+  })
 }
 
-# Subnet for MySQL flexible server
-resource "azurerm_subnet" "mysql_flexible_server_subnet" {
-  name                 = "mysql-flexible-server-subnet"
-  resource_group_name  = azurerm_resource_group.assets.name
-  virtual_network_name = azurerm_virtual_network.assets_vnet.name
-  address_prefixes     = ["10.0.3.0/24"]
-  delegation {
-    name = "mysqlDelegation"
-    service_delegation {
-      name    = "Microsoft.DBforMySQL/flexibleServers"
-      actions = ["Microsoft.Network/virtualNetworks/subnets/join/action"]
+resource "aws_efs_access_point" "snipeit_logs" {
+  file_system_id = aws_efs_file_system.snipeit_efs.id
+
+  posix_user {
+    gid = 1000
+    uid = 1000
+  }
+
+  root_directory {
+    path = "/snipeit-logs"
+    creation_info {
+      owner_gid   = 1000
+      owner_uid   = 1000
+      permissions = "755"
     }
   }
+
+  tags = merge(local.common_tags, {
+    Name = "snipeit-logs-ap"
+  })
 }
 
-# Key Vault
-resource "azurerm_key_vault" "assets_inventory_credentials" {
-  name                        = "assets-inventory-creds"
-  location                    = azurerm_resource_group.assets.location
-  resource_group_name         = azurerm_resource_group.assets.name
-  tenant_id                   = data.azurerm_client_config.current.tenant_id
-  sku_name                    = "standard"
-  soft_delete_retention_days  = 7
-  purge_protection_enabled    = false
-}
+#------------------------------------------------------------------------------
+# ECS Cluster and Service (equivalent to Azure App Service)
+#------------------------------------------------------------------------------
 
-# Key Vault Secrets
-data "azurerm_key_vault_secret" "db_admin_password" {
-  name         = "db-admin-password"
-  key_vault_id = azurerm_key_vault.assets_inventory_credentials.id
-}
+# ECS Cluster
+resource "aws_ecs_cluster" "assets_cluster" {
+  name = "assets-inventory-cluster"
 
-data "azurerm_key_vault_secret" "app_key" {
-  name         = "AppKey"
-  key_vault_id = azurerm_key_vault.assets_inventory_credentials.id
-}
-
-data "azurerm_key_vault_secret" "sendgrid_api_key" {
-  name         = "SendGridApiKey"
-  key_vault_id = azurerm_key_vault.assets_inventory_credentials.id
-}
-
-# MySQL Flexible Server
-resource "azurerm_mysql_flexible_server" "assets_inventory_db" {
-  name                   = "assets-inventory-flexible-server"
-  resource_group_name    = azurerm_resource_group.assets.name
-  location               = azurerm_resource_group.assets.location
-  administrator_login    = "assetsadmin"
-  administrator_password = data.azurerm_key_vault_secret.db_admin_password.value
-  tags                   = {}
-  zone                   = "1"
-  sku_name               = "B_Standard_B1ms"
-  
-  storage {
-    iops    = 360
-    size_gb = 20
-  }
-  
-  version = "8.0.21"
-  
-  delegated_subnet_id = azurerm_subnet.mysql_flexible_server_subnet.id
-}
-
-# MySQL Flexible Database
-resource "azurerm_mysql_flexible_database" "snipeit_db" {
-  name                = "snipeit"
-  resource_group_name = azurerm_mysql_flexible_server.assets_inventory_db.resource_group_name
-  server_name         = azurerm_mysql_flexible_server.assets_inventory_db.name
-  charset             = "utf8mb4"
-  collation           = "utf8mb4_unicode_ci"
-  depends_on          = [azurerm_mysql_flexible_server.assets_inventory_db]
-}
-
-# Storage Account
-resource "azurerm_storage_account" "snipeit_storage_account" {
-  name                     = "assetsinventoryecuad"
-  resource_group_name      = azurerm_resource_group.assets.name
-  location                 = azurerm_resource_group.assets.location
-  account_tier             = "Standard"
-  account_replication_type = "GRS"
-}
-
-# Storage Share for Snipe IT
-resource "azurerm_storage_share" "snipeit" {
-  name                 = "snipeit"
-  storage_account_name = azurerm_storage_account.snipeit_storage_account.name
-  quota                = 50
-}
-
-# Storage Share Logs for Snipe IT
-resource "azurerm_storage_share" "snipeit_logs" {
-  name                 = "snipeit-logs"
-  storage_account_name = azurerm_storage_account.snipeit_storage_account.name
-  quota                = 50
-}
-
-
-# DigiCertGlobalRootCA.crt.pem DB certificate to File Share
-variable "certificate_base64" {
-  default = <<-EOT
-LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURyekNDQXBlZ0F3SUJBZ0lRQ0R2Z1ZwQkNSckdoZFdySldaSEhTakFOQmdrcWhraUc5dzBCQVFVRkFEQmgKTVFzd0NRWURWUVFHRXdKVlV6RVZNQk1HQTFVRUNoTU1SR2xuYVVObGNuUWdTVzVqTVJrd0Z3WURWUVFMRXhCMwpkM2N1WkdsbmFXTmxjblF1WTI5dE1TQXdIZ1lEVlFRREV4ZEVhV2RwUTJWeWRDQkhiRzlpWVd3Z1VtOXZkQ0JEClFUQWVGdzB3TmpFeE1UQXdNREF3TURCYUZ3MHpNVEV4TVRBd01EQXdNREJhTUdFeEN6QUpCZ05WQkFZVEFsVlQKTVJVd0V3WURWUVFLRXd4RWFXZHBRMlZ5ZENCSmJtTXhHVEFYQmdOVkJBc1RFSGQzZHk1a2FXZHBZMlZ5ZEM1agpiMjB4SURBZUJnTlZCQU1URjBScFoybERaWEowSUVkc2IySmhiQ0JTYjI5MElFTkJNSUlCSWpBTkJna3Foa2lHCjl3MEJBUUVGQUFPQ0FROEFNSUlCQ2dLQ0FRRUE0anZoRVhMZXFLVFRvMWVxVUtLUEMzZVF5YUtsN2hMT2xsc0IKQ1NETUFaT25UakMzVS9kRHhHa0FWNTNpalNMZGh3WkFBSUVKenM0Ymc3L2Z6VHR4UnVMV1pzY0ZzM1luRm85NwpuaDZWZmU2M1NLTUkydGF2ZWd3NUJtVi9TbDBmdkJmNHE3N3VLTmQwZjNwNG1WbUZhRzVjSXpKTHYwN0E2RnB0CjQzQy9keEMvL0FIMmhkbW9SQkJZTXFsMUdOWFJvcjVINGlkcTlKb3orRWtJWUl2VVg3UTZoTCtocWtwTWZUN1AKVDE5c2RsNmdTemVSbnR3aTVtM09GQnFPYXN2K3piTVVaQmZIV3ltZU1yL3k3dnJUQzBMVXE3ZEJNdG9NMU8vNApnZFc3alZnL3RSdm9TU2lpY05veEJOMzNzaGJ5VEFwT0I2anRTajFldFgramtNT3ZKd0lEQVFBQm8yTXdZVEFPCkJnTlZIUThCQWY4RUJBTUNBWVl3RHdZRFZSMFRBUUgvQkFVd0F3RUIvekFkQmdOVkhRNEVGZ1FVQTk1UU5WYlIKVEx0bThLUGlHeHZEbDdJOTBWVXdId1lEVlIwakJCZ3dGb0FVQTk1UU5WYlJUTHRtOEtQaUd4dkRsN0k5MFZVdwpEUVlKS29aSWh2Y05BUUVGQlFBRGdnRUJBTXVjTjZwSUV4SUsrdDFFbkU5U3NQVGZyZ1QxZVhrSW95UVkvRXNyCmhNQXR1ZFhIL3ZUQkgxakx1RzJjZW5Ubm1DbXJFYlhqY0tDaHpVeUltWk9Na1hEaXF3OGN2cE9wLzJQVjVBZGcKMDZPL25Wc0o4ZFdPNDFQMGptUDZQNmZidEdiZlltYlcwVzVCamZJdHRlcDNTcCtkV09JcldjQkFJKzB0S0lKRgpQbmxVa2lhWTRJQklxRGZ2OE5aNVlCYmVyT2dPelc2c1JCYzRMMG5hNFVVK0tyazJVODg2VUFiM0x1akVWMGxzCllTRVkxUVN0ZUR3c09vQnJwK3V2RlJUcDJJbkJ1VGhzNHBGc2l2OWt1WGNsVnpEQUd5U2o0ZHpwMzBkOHRiUWsKQ0FVdzdDMjlDNzlGdjFDNXFmUHJtQUVTcmNpSXhwZzBYNDBLUE1icDFaV1ZiZDQ9Ci0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K
-EOT
-}
-
-resource "null_resource" "write_cert" {
-  triggers = {
-    cert_base64 = var.certificate_base64
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
   }
 
-  provisioner "local-exec" {
-    command = "echo '${var.certificate_base64}' | base64 --decode > ${path.module}/DigiCertGlobalRootCA.crt.pem"
+  tags = local.common_tags
+}
+
+# CloudWatch Log Group for ECS
+resource "aws_cloudwatch_log_group" "ecs_logs" {
+  name              = "/ecs/snipeit"
+  retention_in_days = 30
+
+  tags = local.common_tags
+}
+
+# IAM Role for ECS Task Execution
+resource "aws_iam_role" "ecs_task_execution_role" {
+  name = "assets-ecs-task-execution-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy" {
+  role       = aws_iam_role.ecs_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# Policy for Secrets Manager access
+resource "aws_iam_role_policy" "ecs_secrets_policy" {
+  name = "assets-ecs-secrets-policy"
+  role = aws_iam_role.ecs_task_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = [
+          aws_secretsmanager_secret.db_admin_password.arn,
+          aws_secretsmanager_secret.app_key.arn,
+          aws_secretsmanager_secret.sendgrid_api_key.arn
+        ]
+      }
+    ]
+  })
+}
+
+# IAM Role for ECS Task
+resource "aws_iam_role" "ecs_task_role" {
+  name = "assets-ecs-task-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = local.common_tags
+}
+
+# Policy for EFS access from ECS task
+resource "aws_iam_role_policy" "ecs_efs_policy" {
+  name = "assets-ecs-efs-policy"
+  role = aws_iam_role.ecs_task_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "elasticfilesystem:ClientMount",
+          "elasticfilesystem:ClientWrite",
+          "elasticfilesystem:ClientRootAccess"
+        ]
+        Resource = aws_efs_file_system.snipeit_efs.arn
+      }
+    ]
+  })
+}
+
+# ECS Task Definition
+resource "aws_ecs_task_definition" "snipeit" {
+  family                   = "snipeit"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_task_role.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "snipeit"
+      image     = "snipe/snipe-it:latest"
+      essential = true
+
+      portMappings = [
+        {
+          containerPort = 80
+          hostPort      = 80
+          protocol      = "tcp"
+        }
+      ]
+
+      environment = [
+        { name = "APP_URL", value = local.app_url },
+        { name = "APP_TIMEZONE", value = "America/Vancouver" },
+        { name = "APP_ENV", value = "production" },
+        { name = "APP_DEBUG", value = "false" },
+        { name = "APP_LOCALE", value = "en-US" },
+        { name = "MYSQL_DATABASE", value = "snipeit" },
+        { name = "MYSQL_USER", value = "assetsadmin" },
+        { name = "DB_CONNECTION", value = "mysql" },
+        { name = "MYSQL_PORT_3306_TCP_ADDR", value = aws_db_instance.assets_inventory_db.address },
+        { name = "MYSQL_PORT_3306_TCP_PORT", value = "3306" },
+        { name = "DB_SSL", value = "true" },
+        { name = "MAIL_DRIVER", value = "smtp" },
+        { name = "MAIL_ENV_ENCRYPTION", value = "tls" },
+        { name = "MAIL_PORT_587_TCP_ADDR", value = "smtp.sendgrid.net" },
+        { name = "MAIL_PORT_587_TCP_PORT", value = "587" },
+        { name = "MAIL_ENV_USERNAME", value = "apikey" },
+        { name = "MAIL_ENV_FROM_ADDR", value = "assetsadmins@company.com" },
+        { name = "MAIL_ENV_FROM_NAME", value = "Assets Admins" },
+        { name = "SCIM_STANDARDS_COMPLIANCE", value = "true" },
+        { name = "SCIM_TRACE", value = "false" }
+      ]
+
+      secrets = [
+        {
+          name      = "APP_KEY"
+          valueFrom = aws_secretsmanager_secret.app_key.arn
+        },
+        {
+          name      = "MYSQL_PASSWORD"
+          valueFrom = aws_secretsmanager_secret.db_admin_password.arn
+        },
+        {
+          name      = "MAIL_ENV_PASSWORD"
+          valueFrom = aws_secretsmanager_secret.sendgrid_api_key.arn
+        }
+      ]
+
+      mountPoints = [
+        {
+          sourceVolume  = "snipeit-data"
+          containerPath = "/var/lib/snipeit"
+          readOnly      = false
+        },
+        {
+          sourceVolume  = "snipeit-logs"
+          containerPath = "/var/www/html/storage/logs"
+          readOnly      = false
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs_logs.name
+          "awslogs-region"        = data.aws_region.current.name
+          "awslogs-stream-prefix" = "snipeit"
+        }
+      }
+    }
+  ])
+
+  volume {
+    name = "snipeit-data"
+    efs_volume_configuration {
+      file_system_id     = aws_efs_file_system.snipeit_efs.id
+      transit_encryption = "ENABLED"
+      authorization_config {
+        access_point_id = aws_efs_access_point.snipeit_data.id
+        iam             = "ENABLED"
+      }
+    }
+  }
+
+  volume {
+    name = "snipeit-logs"
+    efs_volume_configuration {
+      file_system_id     = aws_efs_file_system.snipeit_efs.id
+      transit_encryption = "ENABLED"
+      authorization_config {
+        access_point_id = aws_efs_access_point.snipeit_logs.id
+        iam             = "ENABLED"
+      }
+    }
+  }
+
+  tags = local.common_tags
+}
+
+#------------------------------------------------------------------------------
+# Application Load Balancer
+#------------------------------------------------------------------------------
+
+# ALB
+resource "aws_lb" "assets_alb" {
+  name               = "assets-inventory-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg.id]
+  subnets            = [aws_subnet.public_subnet_1.id, aws_subnet.public_subnet_2.id]
+
+  enable_deletion_protection = true
+
+  tags = merge(local.common_tags, {
+    Name = "assets-inventory-alb"
+  })
+}
+
+# ALB Target Group
+resource "aws_lb_target_group" "snipeit_tg" {
+  name        = "snipeit-tg"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.assets_vpc.id
+  target_type = "ip"
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 2
+    interval            = 30
+    matcher             = "200,302"
+    path                = "/"
+    port                = "traffic-port"
+    protocol            = "HTTP"
+    timeout             = 5
+    unhealthy_threshold = 3
+  }
+
+  tags = local.common_tags
+}
+
+# ALB Listener (HTTP)
+# Note: For production, configure HTTPS listener and change this to redirect to HTTPS
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.assets_alb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.snipeit_tg.arn
   }
 }
 
-resource "azurerm_storage_share_file" "cert_file" {
-  name             = "DigiCertGlobalRootCA.crt.pem"
-  storage_share_id = azurerm_storage_share.snipeit.id
-  source           = "${path.module}/DigiCertGlobalRootCA.crt.pem"
+# Note: For HTTPS listener, you need to provide an ACM certificate ARN
+# Uncomment and configure when you have a certificate, then change the HTTP listener above to redirect
+# resource "aws_lb_listener" "https" {
+#   load_balancer_arn = aws_lb.assets_alb.arn
+#   port              = "443"
+#   protocol          = "HTTPS"
+#   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+#   certificate_arn   = "arn:aws:acm:region:account:certificate/certificate-id"
+#
+#   default_action {
+#     type             = "forward"
+#     target_group_arn = aws_lb_target_group.snipeit_tg.arn
+#   }
+# }
+#
+# To enable HTTPS redirect, replace the HTTP listener default_action with:
+#   default_action {
+#     type = "redirect"
+#     redirect {
+#       port        = "443"
+#       protocol    = "HTTPS"
+#       status_code = "HTTP_301"
+#     }
+#   }
 
-  depends_on = [null_resource.write_cert]
-}
+#------------------------------------------------------------------------------
+# ECS Service
+#------------------------------------------------------------------------------
 
+resource "aws_ecs_service" "snipeit" {
+  name            = "snipeit-service"
+  cluster         = aws_ecs_cluster.assets_cluster.id
+  task_definition = aws_ecs_task_definition.snipeit.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
 
-# MySQL Flexible Server Configuration for innodb_buffer_pool_load_at_startup
-resource "azurerm_mysql_flexible_server_configuration" "innodb_load_at_startup" {
-  name                = "innodb_buffer_pool_load_at_startup"
-  server_name         = azurerm_mysql_flexible_server.assets_inventory_db.name
-  resource_group_name = azurerm_mysql_flexible_server.assets_inventory_db.resource_group_name
-  value               = "OFF"
-}
-
-# MySQL Flexible Server Configuration for innodb_buffer_pool_dump_at_shutdown
-resource "azurerm_mysql_flexible_server_configuration" "innodb_dump_at_shutdown" {
-  name                = "innodb_buffer_pool_dump_at_shutdown"
-  server_name         = azurerm_mysql_flexible_server.assets_inventory_db.name
-  resource_group_name = azurerm_mysql_flexible_server.assets_inventory_db.resource_group_name
-  value               = "OFF"
-}
-
-# MySQL Flexible Server Configuration for sql_generate_invisible_primary_key
-resource "azurerm_mysql_flexible_server_configuration" "sql_invisible_primary_key" {
-  name                = "sql_generate_invisible_primary_key"
-  server_name         = azurerm_mysql_flexible_server.assets_inventory_db.name
-  resource_group_name = azurerm_mysql_flexible_server.assets_inventory_db.resource_group_name
-  value               = "OFF"
-}
-
-# Service Plan for Azure App Service
-resource "azurerm_service_plan" "assets_inventory_plan" {
-  name                = "assets-inventory-service-plan"
-  location            = azurerm_resource_group.assets.location
-  resource_group_name = azurerm_resource_group.assets.name
-  os_type             = "Linux"
-  sku_name            = "B2"
-}
-
-# Resources for Azure App Service
-resource "azurerm_linux_web_app" "assets_inventory_app" {
-  name                      = local.app_name
-  resource_group_name       = azurerm_resource_group.assets.name
-  location                  = azurerm_resource_group.assets.location
-  service_plan_id           = azurerm_service_plan.assets_inventory_plan.id
-  virtual_network_subnet_id = azurerm_subnet.assets_subnet.id
-
-  site_config {
-    ftps_state                = "Disabled"
-    http2_enabled             = "true"
-
-	application_stack {
-	  docker_image_name   = "index.docker.io/snipe/snipe-it:latest"
-	  }
+  network_configuration {
+    subnets          = [aws_subnet.ecs_subnet.id, aws_subnet.ecs_subnet_2.id]
+    security_groups  = [aws_security_group.ecs_sg.id]
+    assign_public_ip = false
   }
 
-  storage_account {
-    name         = "snipeit"
-    type         = "AzureFiles"
-    account_name = azurerm_storage_account.snipeit_storage_account.name
-    share_name   = azurerm_storage_share.snipeit.name
-    access_key   = azurerm_storage_account.snipeit_storage_account.primary_access_key
-    mount_path   = "/var/lib/snipeit"
+  load_balancer {
+    target_group_arn = aws_lb_target_group.snipeit_tg.arn
+    container_name   = "snipeit"
+    container_port   = 80
   }
 
-  storage_account {
-    name         = "snipeit-logs"
-    type         = "AzureFiles"
-    account_name = azurerm_storage_account.snipeit_storage_account.name
-    share_name   = azurerm_storage_share.snipeit_logs.name
-    access_key   = azurerm_storage_account.snipeit_storage_account.primary_access_key
-    mount_path   = "/var/www/html/storage/logs"
-  }
+  depends_on = [
+    aws_lb_listener.http,
+    aws_efs_mount_target.snipeit_efs_mount_1,
+    aws_efs_mount_target.snipeit_efs_mount_2
+  ]
 
-  app_settings = {
-    "APP_KEY"                             = data.azurerm_key_vault_secret.app_key.value
-    "APP_URL"                             = local.app_url
-    "APP_TIMEZONE"                        = "America/Vancouver"
-    "APP_ENV"                             = "production"
-    "APP_DEBUG"                           = false
-    "APP_LOCALE"                          = "en-US"
-    "MYSQL_DATABASE"                      = "snipeit"
-    "MYSQL_USER"                          = azurerm_mysql_flexible_server.assets_inventory_db.administrator_login
-    "MYSQL_PASSWORD"                      = data.azurerm_key_vault_secret.db_admin_password.value
-    "DB_CONNECTION"                       = "mysql"
-    "WEBSITES_ENABLE_APP_SERVICE_STORAGE" = true
-    "MYSQL_PORT_3306_TCP_ADDR"            = azurerm_mysql_flexible_server.assets_inventory_db.fqdn
-    "MYSQL_PORT_3306_TCP_PORT"            = "3306"
-    "DB_SSL_IS_PAAS"                      = true
-    "DB_SSL"                              = true
-    "DB_SSL_CA_PATH"                      = "/var/lib/snipeit/DigiCertGlobalRootCA.crt.pem"
-    "MAIL_DRIVER"                         = "smtp"
-    "MAIL_ENV_ENCRYPTION"                 = "tcp"
-    "MAIL_PORT_587_TCP_ADDR"              = "smtp.sendgrid.net"
-    "MAIL_PORT_587_TCP_PORT"              = "587"
-    "MAIL_ENV_USERNAME"                   = "apikey"
-    "MAIL_ENV_PASSWORD"                   = data.azurerm_key_vault_secret.sendgrid_api_key.value
-    "MAIL_ENV_FROM_ADDR"                  = "assetsadmins@company.com"
-    "MAIL_ENV_FROM_NAME"                  = "Assets Admins"
-    "SCIM_STANDARDS_COMPLIANCE"           = true
-    "SCIM_TRACE"                          = false
-  }
-
-  https_only = true
+  tags = local.common_tags
 }
 
+#------------------------------------------------------------------------------
+# Outputs
+#------------------------------------------------------------------------------
 
-# Allow MySQL traffic to the virtual network
-resource "azurerm_network_security_rule" "allow_mysql_from_vnet" {
-  name                        = "assets-allow-mysql-from-vnet"
-  priority                    = 101
-  direction                   = "Inbound"
-  access                      = "Allow"
-  protocol                    = "Tcp"
-  source_port_range           = "*"
-  destination_port_range      = "3306"
-  source_address_prefix       = "VirtualNetwork"
-  destination_address_prefix  = "VirtualNetwork"
-  resource_group_name         = azurerm_network_security_group.assets_vnet_nsg.resource_group_name
-  network_security_group_name = azurerm_network_security_group.assets_vnet_nsg.name
+output "alb_dns_name" {
+  description = "DNS name of the Application Load Balancer"
+  value       = aws_lb.assets_alb.dns_name
 }
 
-# Control inbound and outbound network traffic to resources in the vnet
-resource "azurerm_network_security_group" "assets_vnet_nsg" {
-  name                = "assets-vnet-nsg"
-  location            = azurerm_resource_group.assets.location
-  resource_group_name = azurerm_resource_group.assets.name
-
-  security_rule {
-    name                       = "allow-https"
-    priority                   = 100
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "443"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
-  }
-
-  security_rule {
-    name                       = "allow-mysql"
-    priority                   = 110
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*" // Any source port
-    destination_port_range     = "3306" // The MySQL port
-    source_address_prefix      = "10.0.2.0/24" // The subnet of your App Service
-    destination_address_prefix = "10.0.3.0/24" // The subnet of your MySQL server
-  }
+output "rds_endpoint" {
+  description = "Endpoint of the RDS MySQL instance"
+  value       = aws_db_instance.assets_inventory_db.endpoint
 }
 
-# Associates the defined Network Security Group (NSG) with a specific subnet
-resource "azurerm_subnet_network_security_group_association" "nsg_association" {
-  subnet_id                 = azurerm_subnet.assets_subnet.id
-  network_security_group_id = azurerm_network_security_group.assets_vnet_nsg.id
+output "ecs_cluster_name" {
+  description = "Name of the ECS cluster"
+  value       = aws_ecs_cluster.assets_cluster.name
 }
 
-# Integrates an Azure App Service with a subnet within a virtual network
-resource "azurerm_app_service_virtual_network_swift_connection" "assets_connection" {
-  app_service_id = azurerm_linux_web_app.assets_inventory_app.id
-  subnet_id      = azurerm_subnet.assets_subnet.id
+output "efs_file_system_id" {
+  description = "ID of the EFS file system"
+  value       = aws_efs_file_system.snipeit_efs.id
 }

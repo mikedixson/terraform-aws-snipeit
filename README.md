@@ -1,26 +1,32 @@
-# Snipe-IT Azure Infrastructure Deployment with Terraform
+# Snipe-IT AWS Infrastructure Deployment with Terraform
 
-This Terraform plan sets up the necessary resources in Azure for deploying Snipe-IT, an open-source IT asset management system. The resources created include a Resource Group, Virtual Network, Subnet, MySQL database, Storage Account, and Web App for hosting Snipe-IT.
+This Terraform plan sets up the necessary resources in AWS for deploying Snipe-IT, an open-source IT asset management system. The resources created include a VPC, Subnets, RDS MySQL database, EFS storage, ECS Fargate service, and Application Load Balancer for hosting Snipe-IT.
 
 ## Prerequisites
 
 Before you begin, ensure you have the following:
 
 - [Terraform](https://www.terraform.io/downloads.html) installed on your local machine.
-- An Azure account with the necessary permissions to create resources.
-- [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli) installed and authenticated.
-- Service Principal credentials for Terraform to use (App ID, Tenant ID, and Client Secret).
+- An AWS account with the necessary permissions to create resources.
+- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) installed and configured.
+- AWS credentials configured (via environment variables, AWS CLI, or IAM role).
 
 ## Configuration
 
-### Service Principal
+### AWS Credentials
 
-Set up the Service Principal credentials as environment variables:
+Set up AWS credentials as environment variables:
 
 ```bash
-export AZURE_TENANT_ID=<your-tenant-id>
-export AZURE_CLIENT_ID=<your-client-id>
-export AZURE_CLIENT_SECRET=<your-client-secret>
+export AWS_ACCESS_KEY_ID=<your-access-key-id>
+export AWS_SECRET_ACCESS_KEY=<your-secret-access-key>
+export AWS_REGION=<your-preferred-region>
+```
+
+Or configure via AWS CLI:
+
+```bash
+aws configure
 ```
 
 ### Terraform Variables
@@ -30,126 +36,176 @@ Edit the `main.tf` file or create a `terraform.tfvars` file to configure the fol
 - `app_name`: Name of the application (default: `assets-inventory-company`).
 - `app_url`: URL for the application (default: `https://assets.inventory.company.com`).
 
+## Architecture
+
+The Terraform plan creates the following AWS infrastructure:
+
+```
+                                    ┌─────────────────────────────────────────────────────────────┐
+                                    │                          VPC                                │
+                                    │                      10.0.0.0/16                            │
+                                    │                                                             │
+    ┌───────────────┐               │  ┌─────────────────────────────────────────────────────┐    │
+    │   Internet    │◄──────────────┼──│              Internet Gateway                       │    │
+    └───────────────┘               │  └─────────────────────────────────────────────────────┘    │
+           │                        │                          │                                  │
+           │                        │  ┌───────────────────────┴───────────────────────┐          │
+           │                        │  │           Public Subnets (10.0.1.0/24,        │          │
+           │                        │  │                       10.0.4.0/24)             │          │
+           ▼                        │  │  ┌─────────────────────────────────────────┐  │          │
+    ┌───────────────┐               │  │  │       Application Load Balancer         │  │          │
+    │     ALB       │◄──────────────┼──┼──│           (HTTP/HTTPS)                  │  │          │
+    │  (Port 443)   │               │  │  └─────────────────────────────────────────┘  │          │
+    └───────────────┘               │  │  ┌─────────────────────────────────────────┐  │          │
+           │                        │  │  │           NAT Gateway                   │  │          │
+           │                        │  │  └─────────────────────────────────────────┘  │          │
+           │                        │  └───────────────────────┬───────────────────────┘          │
+           │                        │                          │                                  │
+           │                        │  ┌───────────────────────┴───────────────────────┐          │
+           │                        │  │           Private Subnets (ECS)               │          │
+           ▼                        │  │           (10.0.2.0/24, 10.0.5.0/24)          │          │
+    ┌───────────────┐               │  │  ┌─────────────────────────────────────────┐  │          │
+    │  ECS Fargate  │◄──────────────┼──┼──│         Snipe-IT Container              │  │          │
+    │   Service     │               │  │  │         (snipe/snipe-it:latest)         │  │          │
+    └───────────────┘               │  │  └─────────────────────────────────────────┘  │          │
+           │                        │  └───────────────────────────────────────────────┘          │
+           │                        │                          │                                  │
+           ▼                        │  ┌───────────────────────┴───────────────────────┐          │
+    ┌───────────────┐               │  │           Private Subnets (RDS)               │          │
+    │  RDS MySQL    │◄──────────────┼──│           (10.0.3.0/24, 10.0.6.0/24)          │          │
+    │  (Port 3306)  │               │  │  ┌─────────────────────────────────────────┐  │          │
+    └───────────────┘               │  │  │         MySQL 8.0 Database              │  │          │
+                                    │  │  └─────────────────────────────────────────┘  │          │
+                                    │  └───────────────────────────────────────────────┘          │
+                                    │                                                             │
+                                    │  ┌─────────────────────────────────────────────────────┐    │
+                                    │  │                      EFS                            │    │
+                                    │  │         (Persistent Storage for Snipe-IT)          │    │
+                                    │  └─────────────────────────────────────────────────────┘    │
+                                    └─────────────────────────────────────────────────────────────┘
+```
+
 ## Deployment
 
 ### Step-by-Step Deployment
 
 This Terraform plan automates the provisioning of the following resources:
 
-1. **Resource Group**: Creates a resource group for organizing all resources.
-2. **Virtual Network and Subnet**: Creates a virtual network and subnet for network isolation.
-3. **Azure MySQL PaaS Instance**: Provisions a MySQL database instance.
-4. **Azure Storage Account**: Creates a storage account for storing Snipe-IT files and logs.
-5. **Azure Web App**: Sets up a web app for hosting the Snipe-IT Docker container.
+1. **VPC and Networking**: Creates a VPC with public and private subnets, Internet Gateway, NAT Gateway, and route tables.
+2. **Security Groups**: Creates security groups for ALB, ECS, RDS, and EFS with appropriate ingress/egress rules.
+3. **AWS Secrets Manager**: Creates secrets for database password, app key, and SendGrid API key.
+4. **RDS MySQL**: Provisions a MySQL 8.0 database instance with the required parameter configurations.
+5. **EFS**: Creates an Elastic File System for persistent storage with access points for Snipe-IT data and logs.
+6. **ECS Cluster and Service**: Sets up an ECS Fargate cluster with a task definition running the Snipe-IT Docker container.
+7. **Application Load Balancer**: Creates an ALB with HTTP listener (configured for HTTPS redirect).
 
 ### Detailed Steps
 
-1. **Initialize and Apply Terraform Plan**
-
-    Initialize Terraform:
+1. **Initialize Terraform**
 
     ```bash
     terraform init
     ```
 
-    Plan the deployment:
+2. **Create Secrets in AWS Secrets Manager**
+
+    Before applying the Terraform plan, create the required secrets:
+
+    ```bash
+    # Generate an APP_KEY (Laravel requires a base64 encoded 32-character key)
+    APP_KEY=$(echo -n "base64:$(openssl rand -base64 32)")
+    
+    # Create secrets
+    aws secretsmanager create-secret --name "assets-inventory/db-admin-password" --secret-string "your-secure-db-password"
+    aws secretsmanager create-secret --name "assets-inventory/app-key" --secret-string "$APP_KEY"
+    aws secretsmanager create-secret --name "assets-inventory/sendgrid-api-key" --secret-string "your-sendgrid-api-key"
+    ```
+
+3. **Plan the Deployment**
 
     ```bash
     terraform plan
     ```
 
-    Apply the Terraform plan:
+4. **Apply the Terraform Plan**
 
     ```bash
     terraform apply
     ```
 
-2. **MySQL Database Setup**
+5. **Configure HTTPS (Recommended)**
 
-    The Terraform plan will create an Azure Database for MySQL flexible server with the specified configurations:
-    - MySQL instance name
-    - Region
-    - Workload type
-    - Username and password
+    After the initial deployment:
+    
+    - Request or import an SSL certificate in AWS Certificate Manager (ACM)
+    - Uncomment the HTTPS listener in `main.tf`
+    - Update the `certificate_arn` with your ACM certificate ARN
+    - Run `terraform apply` again
 
-    After the instance is created, the plan will also:
-    - Create an empty database `snipe-it`
-    - Set the following MySQL server parameters to `OFF` to avoid migration issues:
-      - `innodb_buffer_pool_load_at_startup`
-      - `innodb_buffer_pool_dump_at_shutdown`
-      - `sql_generate_invisible_primary_key`
+6. **Configure DNS**
 
-3. **Storage Account Setup**
-
-    The Terraform plan will provision a storage account with the following configurations:
-    - Storage account name
-    - Region
-    - Public access settings
-
-    It will also create:
-    - A file share called `snipeit` for storing the SSL certificate
-    - A file share called `snipeit-logs` for storing application logs
-
-    The plan will aslo upload the DB's `DigiCertGlobalRootCA.crt.pem` SSL certificate to the file share automatically.
-   
-5. **Web App Setup**
-
-    The Terraform plan will set up a web app with the following configurations:
-    - App name
-    - Docker container settings (image: `snipe/snipe-it:latest`)
-    - Pricing tier (Basic B1)
-
-    It will also configure path mappings for Azure Storage:
-    - Mount the file share `snipeit` to `/var/lib/snipeit`
-    - Mount the file share `snipeit-logs` to `/var/www/html/storage/logs`
-
-    Additionally, it will set the necessary application settings:
-    - `MYSQL_DATABASE`
-    - `MYSQL_USER`
-    - `MYSQL_PASSWORD`
-    - `DB_CONNECTION`
-    - `MYSQL_PORT_3306_TCP_ADDR`
-    - `MYSQL_PORT_3306_TCP_PORT`
-    - `DB_SSL_IS_PAAS`
-    - `DB_SSL`
-    - `DB_SSL_CA_PATH`
-    - `APP_URL`
-    - `APP_KEY`
-    - `MAIL_DRIVER`
-    - `MAIL_ENV_ENCRYPTION`
-    - `MAIL_PORT_587_TCP_ADDR`
-    - `MAIL_PORT_587_TCP_PORT`
-    - `MAIL_ENV_USERNAME`
-    - `MAIL_ENV_PASSWORD`
-    - `MAIL_ENV_FROM_ADDR`
-    - `MAIL_ENV_FROM_NAME`
-    - `APP_DEBUG`
-
-6. **Docker Compose Configuration**
-
-    The Terraform plan will configure the web app to use Docker Compose with the following configuration:
-
-    ```yaml
-    version: "3"
-
-    services:
-      snipe-it:
-        image: snipe/snipe-it:latest
-        volumes:
-          - snipeit:/var/lib/snipeit
-          - snipeit-logs:/var/www/html/storage/logs
-
-    volumes:
-      snipeit:
-        external: true
-      snipeit-logs:
-        external: true
+    Point your domain to the ALB DNS name (output from Terraform):
+    
+    ```bash
+    terraform output alb_dns_name
     ```
 
-7. **Finalize Deployment**
+    Create a CNAME record in your DNS provider pointing to this DNS name.
 
-    After all resources are provisioned and configured, the web app will restart, and you can access the Snipe-IT setup wizard via the URL of the web app.
+## Resources Created
 
+| Resource Type | Name | Description |
+|---------------|------|-------------|
+| VPC | assets-vpc | Virtual Private Cloud (10.0.0.0/16) |
+| Subnets | assets-public-subnet-1/2 | Public subnets for ALB |
+| Subnets | assets-ecs-subnet-1/2 | Private subnets for ECS |
+| Subnets | assets-mysql-subnet-1/2 | Private subnets for RDS |
+| Internet Gateway | assets-igw | Internet access for public subnets |
+| NAT Gateway | assets-nat-gateway | Outbound internet for private subnets |
+| Security Groups | assets-alb-sg, assets-ecs-sg, assets-mysql-sg, assets-efs-sg | Network security |
+| Secrets Manager | assets-inventory/* | Secrets storage |
+| RDS MySQL | assets-inventory-db | MySQL 8.0 database |
+| EFS | snipeit-efs | Persistent file storage |
+| ECS Cluster | assets-inventory-cluster | Container orchestration |
+| ECS Service | snipeit-service | Fargate service running Snipe-IT |
+| ALB | assets-inventory-alb | Application Load Balancer |
+
+## Outputs
+
+After successful deployment, Terraform will output:
+
+- `alb_dns_name`: DNS name of the Application Load Balancer
+- `rds_endpoint`: Endpoint of the RDS MySQL instance
+- `ecs_cluster_name`: Name of the ECS cluster
+- `efs_file_system_id`: ID of the EFS file system
+
+## Cost Considerations
+
+The default configuration uses cost-effective resources suitable for development/small production:
+
+- **RDS**: db.t3.micro (eligible for free tier)
+- **ECS**: Fargate with 0.5 vCPU, 1GB memory
+- **EFS**: Pay-per-use with lifecycle policy
+- **NAT Gateway**: Hourly charge + data processing
+
+For production workloads, consider:
+- Upgrading RDS instance class
+- Enabling Multi-AZ for RDS
+- Increasing ECS task CPU/memory
+- Adding auto-scaling policies
+
+## Cleanup
+
+To destroy all resources:
+
+```bash
+terraform destroy
+```
+
+**Note**: RDS has deletion protection enabled by default. To delete:
+1. Modify `deletion_protection = false` in `main.tf`
+2. Run `terraform apply`
+3. Run `terraform destroy`
 
 ## License
 
@@ -159,4 +215,4 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 - [Snipe-IT](https://snipeitapp.com/) for providing the open-source IT asset management system.
 - [Terraform](https://www.terraform.io/) for infrastructure as code tooling.
-- [Azure](https://azure.microsoft.com/) for cloud services.
+- [AWS](https://aws.amazon.com/) for cloud services.
