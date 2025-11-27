@@ -2,13 +2,14 @@ terraform {
   required_version = "~> 1.0"
 
   required_providers {
-    azurerm = {
-      source  = "hashicorp/azurerm"
-      version = "~> 3.96.0"
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
     }
   }
 }
 
-provider "azurerm" {
-  features {}
+provider "aws" {
+  # Configure the AWS region via environment variable AWS_REGION or here
+  # region = "us-west-2"
 }
