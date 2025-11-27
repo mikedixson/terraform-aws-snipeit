@@ -599,6 +599,27 @@ resource "aws_iam_role" "ecs_task_role" {
   tags = local.common_tags
 }
 
+# Policy for EFS access from ECS task
+resource "aws_iam_role_policy" "ecs_efs_policy" {
+  name = "assets-ecs-efs-policy"
+  role = aws_iam_role.ecs_task_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "elasticfilesystem:ClientMount",
+          "elasticfilesystem:ClientWrite",
+          "elasticfilesystem:ClientRootAccess"
+        ]
+        Resource = aws_efs_file_system.snipeit_efs.arn
+      }
+    ]
+  })
+}
+
 # ECS Task Definition
 resource "aws_ecs_task_definition" "snipeit" {
   family                   = "snipeit"
@@ -754,25 +775,21 @@ resource "aws_lb_target_group" "snipeit_tg" {
   tags = local.common_tags
 }
 
-# ALB Listener (HTTP - redirects to HTTPS)
+# ALB Listener (HTTP)
+# Note: For production, configure HTTPS listener and change this to redirect to HTTPS
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.assets_alb.arn
   port              = "80"
   protocol          = "HTTP"
 
   default_action {
-    type = "redirect"
-
-    redirect {
-      port        = "443"
-      protocol    = "HTTPS"
-      status_code = "HTTP_301"
-    }
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.snipeit_tg.arn
   }
 }
 
 # Note: For HTTPS listener, you need to provide an ACM certificate ARN
-# Uncomment and configure when you have a certificate
+# Uncomment and configure when you have a certificate, then change the HTTP listener above to redirect
 # resource "aws_lb_listener" "https" {
 #   load_balancer_arn = aws_lb.assets_alb.arn
 #   port              = "443"
@@ -785,6 +802,16 @@ resource "aws_lb_listener" "http" {
 #     target_group_arn = aws_lb_target_group.snipeit_tg.arn
 #   }
 # }
+#
+# To enable HTTPS redirect, replace the HTTP listener default_action with:
+#   default_action {
+#     type = "redirect"
+#     redirect {
+#       port        = "443"
+#       protocol    = "HTTPS"
+#       status_code = "HTTP_301"
+#     }
+#   }
 
 #------------------------------------------------------------------------------
 # ECS Service
